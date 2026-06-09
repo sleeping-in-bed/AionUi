@@ -24,7 +24,9 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { startWebHost } from '@aionui/web-host';
+import { createServer as createViteServer, type ViteDevServer } from 'vite';
+import { startWebHost, type WebHostHandle } from '@aionui/web-host';
+import { createRendererViteConfig } from '../packages/desktop/viteRendererConfig.js';
 import { openBrowserUrl, shouldAutoOpenBrowser } from '../packages/web-cli/src/browser.js';
 
 // Aligned with packages/desktop/src/common/config/constants.ts WEBUI_DEFAULT_PORT.
@@ -46,6 +48,10 @@ const getFlag = (name: string): string | undefined => {
   const next = args[idx + 1];
   return next && !next.startsWith('--') ? next : undefined;
 };
+
+function hasDevMode(): boolean {
+  return has('--dev') || parseBoolean(process.env.AIONUI_DEV_SERVER);
+}
 
 /**
  * Resolve the directory where aioncore persists its SQLite DB.
@@ -127,6 +133,7 @@ function resolveStaticDir(): string {
  *   $AIONUI_STATIC_DIR is set : caller is pointing us at a prebuilt artifact dir
  */
 function runPackageIfNeeded(): void {
+  if (hasDevMode()) return;
   if (has('--no-build')) return;
   if (parseBoolean(process.env.AIONUI_NO_BUILD)) return;
   if (process.env.AIONUI_STATIC_DIR) return;
@@ -183,6 +190,62 @@ function augmentPathWithNvm(): void {
   }
 }
 
+function readAppVersion(): string {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')) as { version?: string };
+    return pkg.version || '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+}
+
+function resolveDevServerPort(): number {
+  const cli = getFlag('--dev-server-port');
+  if (cli && /^\d+$/.test(cli)) return Number(cli);
+  const env = process.env.AIONUI_DEV_SERVER_PORT;
+  if (env && /^\d+$/.test(env)) return Number(env);
+  return 5173;
+}
+
+async function startRendererDevServer(): Promise<ViteDevServer> {
+  const appVersion = readAppVersion();
+  const isDevelopment = (process.env.NODE_ENV ?? 'development') === 'development';
+  const enableSentrySourceMaps = !isDevelopment && !!process.env.SENTRY_AUTH_TOKEN;
+  const sentryPluginOptions = {
+    org: process.env.SENTRY_ORG,
+    project: process.env.SENTRY_PROJECT,
+    authToken: process.env.SENTRY_AUTH_TOKEN,
+    sourcemaps: {
+      filesToDeleteAfterUpload: ['./out/**/*.map'],
+      rewriteSources: (source: string) => {
+        // Normalize Windows backslashes and strip leading relative prefixes
+        // so Sentry paths match the GitHub repo structure (e.g.
+        // packages/desktop/src/process/...)
+        return source.replace(/\\/g, '/').replace(/^(\.\.\/)+(packages\/desktop\/src\/)/, '$2');
+      },
+    },
+  };
+  const requestedPort = resolveDevServerPort();
+  const viteServer = await createViteServer({
+    ...createRendererViteConfig({
+      mode: 'development',
+      appVersion,
+      enableSentrySourceMaps,
+      sentryPluginOptions,
+    }),
+    configFile: false,
+    server: {
+      port: requestedPort,
+      strictPort: false,
+      hmr: {
+        host: 'localhost',
+      },
+    },
+  });
+  await viteServer.listen();
+  return viteServer;
+}
+
 /**
  * Read the WebUI admin username from backend. Returns 'admin' as a best-effort
  * fallback — useful when the backend is unreachable or the SQLite users row
@@ -202,6 +265,8 @@ async function fetchAdminUsername(backendPort: number): Promise<string> {
 async function main(): Promise<void> {
   augmentPathWithNvm();
   runPackageIfNeeded();
+  const devMode = hasDevMode();
+  const appVersion = readAppVersion();
   const port = resolvePort();
   const allowRemote = resolveAllowRemote();
   const autoOpenBrowser = shouldAutoOpenBrowser({
@@ -214,43 +279,65 @@ async function main(): Promise<void> {
   // history live here. Admin credentials live in the backend's users table.
   // This keeps `bun run webui` fully self-contained on hosts without AionUi.app.
   const workDir = resolveBackendDataDir();
-  const staticDir = resolveStaticDir();
+  const staticDir = devMode ? path.join(repoRoot, 'out', 'renderer') : resolveStaticDir();
   const backendBin = resolveBackendBinary();
   const logDir = process.env.AIONUI_LOG_DIR ?? path.join(workDir, 'logs');
+  let viteServer: ViteDevServer | null = null;
+  let devServerPort: number | undefined;
+
+  if (devMode) {
+    viteServer = await startRendererDevServer();
+    const address = viteServer.httpServer?.address();
+    if (!address || typeof address === 'string') {
+      throw new Error('Vite dev server did not expose a TCP port');
+    }
+    devServerPort = address.port;
+  }
 
   console.log('[webui] work dir   :', workDir);
-  console.log('[webui] static dir :', staticDir);
+  if (devMode) {
+    console.log('[webui] frontend   :', `Vite dev server on http://127.0.0.1:${devServerPort}`);
+  } else {
+    console.log('[webui] static dir :', staticDir);
+  }
   console.log('[webui] backend bin:', backendBin);
-  console.log(`[webui] launching  : port=${port} allowRemote=${allowRemote}`);
+  console.log(`[webui] launching  : port=${port} allowRemote=${allowRemote} dev=${devMode}`);
 
-  const handle = await startWebHost({
-    app: {
-      version: '0.0.0',
-      isPackaged: false,
-      resourcesPath: repoRoot,
-      userDataPath: workDir,
-    },
-    staticDir,
-    port,
-    allowRemote,
-    dataDir: workDir,
-    logDir,
-    // Surface the same work dir on /api/system/info so the browser UI shows
-    // where standalone webui is actually persisting data. Without this the
-    // backend inherits process.env and may report the parent shell's cwd.
-    dirs: {
-      cacheDir: workDir,
-      workDir: workDir,
+  let handle: WebHostHandle;
+  try {
+    handle = await startWebHost({
+      app: {
+        version: appVersion,
+        isPackaged: false,
+        resourcesPath: repoRoot,
+        userDataPath: workDir,
+      },
+      staticDir,
+      devServerPort,
+      port,
+      allowRemote,
+      dataDir: workDir,
       logDir,
-    },
-    backend: {
-      kind: 'ownBackend',
-      resolveBackend: () => backendBin,
-    },
-  });
+      // Surface the same work dir on /api/system/info so the browser UI shows
+      // where standalone webui is actually persisting data. Without this the
+      // backend inherits process.env and may report the parent shell's cwd.
+      dirs: {
+        cacheDir: workDir,
+        workDir: workDir,
+        logDir,
+      },
+      backend: {
+        kind: 'ownBackend',
+        resolveBackend: () => backendBin,
+      },
+    });
+  } catch (err) {
+    await viteServer?.close();
+    throw err;
+  }
 
   console.log('');
-  console.log('AionUi WebUI is ready');
+  console.log(devMode ? 'AionUi WebUI dev server is ready' : 'AionUi WebUI is ready');
   console.log(`  Local  : ${handle.localUrl}`);
   if (handle.networkUrl) console.log(`  Network: ${handle.networkUrl}`);
 
@@ -314,6 +401,7 @@ async function main(): Promise<void> {
     } catch (err) {
       console.error('[webui] stop error:', err);
     } finally {
+      await viteServer?.close();
       process.exit(0);
     }
   };

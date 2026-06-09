@@ -26,6 +26,18 @@ async function startMockBackend(
   };
 }
 
+async function startMockFrontend(
+  handler: (req: http.IncomingMessage, res: http.ServerResponse) => void
+): Promise<{ port: number; close: () => Promise<void> }> {
+  const server = http.createServer(handler);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const port = (server.address() as AddressInfo).port;
+  return {
+    port,
+    close: () => new Promise<void>((r) => server.close(() => r())),
+  };
+}
+
 describe('static-server', () => {
   let handle: StaticServerHandle | null = null;
   let stopBackend: (() => Promise<void>) | null = null;
@@ -221,6 +233,88 @@ describe('static-server', () => {
         reject(new Error('timeout waiting for 101'));
       }, 3000).unref();
     });
+    expect(status).toMatch(/HTTP\/1\.1 101/i);
+  });
+
+  it('dev server HTTP requests are proxied through the public WebUI port', async () => {
+    const backend = await startMockBackend((_req, res) => res.end('backend'));
+    stopBackend = backend.close;
+    const frontend = await startMockFrontend((req, res) => {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end(`frontend:${req.url}`);
+    });
+    const stopFrontend = frontend.close;
+    handle = await startStaticServer({
+      staticDir,
+      devServerPort: frontend.port,
+      backendPort: backend.port,
+      port: 0,
+    });
+
+    const r = await fetch(`${handle.localUrl}/chat/123`);
+    expect(r.status).toBe(200);
+    expect(await r.text()).toBe('frontend:/chat/123');
+
+    await stopFrontend();
+  });
+
+  it('dev server WebSocket upgrades are spliced through the public WebUI port', async () => {
+    const backend = await startMockBackend((_req, res) => res.end('backend'));
+    stopBackend = backend.close;
+    const { createHash } = await import('node:crypto');
+    const httpMod = await import('node:http');
+    const net = await import('node:net');
+    const frontendServer = httpMod.createServer();
+    frontendServer.on('upgrade', (req, socket) => {
+      const wsKey = (req.headers['sec-websocket-key'] as string) || '';
+      const accept = createHash('sha1')
+        .update(wsKey + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
+        .digest('base64');
+      socket.write('HTTP/1.1 101 Switching Protocols\r\n');
+      socket.write('Upgrade: websocket\r\n');
+      socket.write('Connection: Upgrade\r\n');
+      socket.write(`Sec-WebSocket-Accept: ${accept}\r\n\r\n`);
+      socket.end();
+    });
+    await new Promise<void>((r) => frontendServer.listen(0, '127.0.0.1', () => r()));
+    const frontendPort = (frontendServer.address() as { port: number }).port;
+    handle = await startStaticServer({
+      staticDir,
+      devServerPort: frontendPort,
+      backendPort: backend.port,
+      port: 0,
+    });
+
+    const status: string = await new Promise((resolve, reject) => {
+      const sock = net.connect({ host: '127.0.0.1', port: handle!.port }, () => {
+        sock.write(
+          'GET /@vite/client HTTP/1.1\r\n' +
+            `Host: 127.0.0.1:${handle!.port}\r\n` +
+            'Upgrade: websocket\r\n' +
+            'Connection: Upgrade\r\n' +
+            'Sec-WebSocket-Version: 13\r\n' +
+            'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n' +
+            '\r\n'
+        );
+      });
+      let buf = Buffer.alloc(0);
+      sock.on('data', (d) => {
+        buf = Buffer.concat([buf, d]);
+        const headEnd = buf.indexOf('\r\n\r\n');
+        if (headEnd >= 0) {
+          const firstLine = buf.slice(0, buf.indexOf(0x0a)).toString('ascii');
+          sock.destroy();
+          resolve(firstLine.trim());
+        }
+      });
+      sock.on('error', reject);
+      setTimeout(() => {
+        sock.destroy();
+        reject(new Error('timeout waiting for dev-server 101'));
+      }, 3000).unref();
+    });
+
+    await new Promise<void>((resolve) => frontendServer.close(() => resolve()));
     expect(status).toMatch(/HTTP\/1\.1 101/i);
   });
 

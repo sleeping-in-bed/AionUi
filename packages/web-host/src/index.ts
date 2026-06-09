@@ -53,6 +53,7 @@ export async function startWebHost(opts: WebHostOptions): Promise<WebHostHandle>
     // 2. Start static-server (M5)
     staticHandle = await startStaticServer({
       staticDir: opts.staticDir,
+      devServerPort: opts.devServerPort,
       backendPort: backendHandle.port,
       port: opts.port,
       allowRemote: opts.allowRemote ?? false,

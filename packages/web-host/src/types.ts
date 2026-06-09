@@ -33,6 +33,7 @@ export type BackendSystemDirs = {
 export type WebHostOptions = {
   app: AppMetadata;
   staticDir: string;
+  devServerPort?: number;
   port?: number;
   allowRemote?: boolean;
   dataDir?: string;

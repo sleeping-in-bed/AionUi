@@ -16,6 +16,7 @@ import serveHandler from 'serve-handler';
 
 export type StaticServerOptions = {
   staticDir: string;
+  devServerPort?: number;
   backendPort: number;
   port?: number;
   allowRemote?: boolean;
@@ -42,13 +43,13 @@ function getLanIP(): string | null {
   return null;
 }
 
-function forwardToBackend(req: IncomingMessage, res: ServerResponse, backendPort: number): void {
+function forwardToHttpServer(req: IncomingMessage, res: ServerResponse, targetPort: number): void {
   const options: http.RequestOptions = {
     hostname: '127.0.0.1',
-    port: backendPort,
+    port: targetPort,
     path: req.url,
     method: req.method,
-    headers: { ...req.headers, host: `127.0.0.1:${backendPort}` },
+    headers: { ...req.headers, host: `127.0.0.1:${targetPort}` },
   };
   const proxy = http.request(options, (proxyRes) => {
     res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
@@ -100,26 +101,53 @@ function spliceToTcpEndpoint(client: Socket, targetPort: number, initialBytes: B
 
 /**
  * Decide routing from the first chunk of an incoming HTTP connection:
- *  - `true`  → `GET /ws[...] HTTP/1.x` (WebSocket upgrade), splice to backend
- *  - `false` → any other HTTP method / path, hand to internal HTTP server
- *  - `null`  → need more bytes (no CRLF yet)
+ *  - `backend`  → `GET /ws[...] HTTP/1.x`, splice to backend
+ *  - `frontend` → non-backend WebSocket upgrade in dev mode, splice to Vite
+ *  - `internal` → normal HTTP request, hand to internal HTTP server
+ *  - `null`     → need more bytes
  *
- * We only check the request-line; `Upgrade: websocket` is not strictly
- * required — the backend will reject a non-upgrade `GET /ws` on its own.
- * Keeping the rule simple means we can decide after the first ~50 bytes
- * instead of waiting for the full header block.
+ * For `/ws` we can safely decide from the request-line alone. For Vite's HMR
+ * WebSocket we must wait until the header block arrives so we can confirm the
+ * upgrade request before bypassing the internal HTTP proxy.
  */
-function peekWsRoute(buf: Buffer): boolean | null {
+function peekTcpRoute(buf: Buffer, hasDevServer: boolean): 'backend' | 'frontend' | 'internal' | null {
   const newlineIdx = buf.indexOf(0x0a); // \n
   if (newlineIdx < 0) return null;
   const firstLine = buf.slice(0, newlineIdx).toString('ascii');
-  return /^GET\s+\/ws(?:\?[^\s]*)?\s+HTTP\/1\.[01]\r?$/.test(firstLine);
+  const match = firstLine.match(/^([A-Z]+)\s+([^\s]+)\s+HTTP\/1\.[01]\r?$/);
+  if (!match) {
+    if (buf.length >= PEEK_LIMIT_BYTES || buf.includes(Buffer.from('\r\n\r\n'))) return 'internal';
+    return null;
+  }
+
+  const [, method, requestPath] = match;
+  if (method === 'GET' && /^\/ws(?:\?[^\s]*)?$/.test(requestPath)) {
+    return 'backend';
+  }
+
+  const headEnd = buf.indexOf(Buffer.from('\r\n\r\n'));
+  if (headEnd < 0 && buf.length < PEEK_LIMIT_BYTES) {
+    return null;
+  }
+
+  if (!hasDevServer) {
+    return 'internal';
+  }
+
+  const headersText = buf
+    .slice(0, headEnd >= 0 ? headEnd : buf.length)
+    .toString('ascii')
+    .toLowerCase();
+  const isWebSocketUpgrade =
+    /\r\nupgrade:\s*websocket\r\n/.test(headersText) && /\r\nconnection:[^\r\n]*upgrade/.test(headersText);
+  return isWebSocketUpgrade ? 'frontend' : 'internal';
 }
 
 export async function startStaticServer(opts: StaticServerOptions): Promise<StaticServerHandle> {
   const port = opts.port ?? DEFAULT_PORT;
   const allowRemote = opts.allowRemote === true;
   const host = allowRemote ? '0.0.0.0' : '127.0.0.1';
+  const hasDevServer = typeof opts.devServerPort === 'number';
 
   // The HTTP server listens only on loopback — user traffic hits the outer
   // net.Server first. We route to this server for everything except WS
@@ -141,7 +169,12 @@ export async function startStaticServer(opts: StaticServerOptions): Promise<Stat
       // /login and /logout are aionui-auth's top-level auth endpoints: proxy them too
       // so WebUI browser clients reach the backend without a path-rewrite.
       if (req.url.startsWith('/api/') || req.url.startsWith('/api?') || req.url === '/login' || req.url === '/logout') {
-        forwardToBackend(req, res, opts.backendPort);
+        forwardToHttpServer(req, res, opts.backendPort);
+        return;
+      }
+
+      if (typeof opts.devServerPort === 'number') {
+        forwardToHttpServer(req, res, opts.devServerPort);
         return;
       }
 
@@ -189,10 +222,15 @@ export async function startStaticServer(opts: StaticServerOptions): Promise<Stat
     };
     const onData = (chunk: Buffer): void => {
       peeked = Buffer.concat([peeked, chunk]);
-      const decision = peekWsRoute(peeked);
+      const decision = peekTcpRoute(peeked, hasDevServer);
       if (decision === null && peeked.length < PEEK_LIMIT_BYTES) return;
       cleanup();
-      const target = decision === true ? opts.backendPort : internalPort;
+      const target =
+        decision === 'backend'
+          ? opts.backendPort
+          : decision === 'frontend'
+            ? (opts.devServerPort as number)
+            : internalPort;
       spliceToTcpEndpoint(client, target, peeked);
     };
     const onEarlyError = (): void => {

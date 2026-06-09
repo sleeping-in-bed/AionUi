@@ -30,6 +30,8 @@ bun start
 | `bun start`                 | Start Electron app in development mode (desktop)                                                               |
 | `bun run start:multi`       | Start a second Electron instance alongside an existing one (see [Multi-Instance](#multi-instance-development)) |
 | `bun run cli`               | Alias for `bun start`                                                                                          |
+| `bun run webui:dev`         | Start browser-based WebUI in development mode with Vite HMR                                                    |
+| `bun run webui:dev:remote`  | Start browser-based WebUI in development mode with Vite HMR and remote access                                  |
 | `bun run webui`             | Start in WebUI mode (browser-based, no Electron window)                                                        |
 | `bun run webui:remote`      | Start in WebUI mode with remote access enabled                                                                 |
 | `bun run webui:prod`        | Start WebUI in production mode                                                                                 |
