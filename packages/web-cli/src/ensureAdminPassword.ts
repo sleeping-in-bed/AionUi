@@ -18,6 +18,8 @@
  * that script.
  */
 
+import { enforceConfiguredAdminCredentials, resolveConfiguredAdminCredentials } from './adminCredentials.js';
+
 export type EnsureAdminPasswordDeps = {
   fetch: typeof fetch;
   log: (msg: string) => void;
@@ -103,6 +105,25 @@ export async function ensureAdminPassword(
   const intervalMs = opts.statusPollIntervalMs ?? 500;
   const resetCmd = opts.resetCommand ?? 'aionui-web resetpass';
   const base = `http://127.0.0.1:${opts.backendPort}`;
+  const configuredAdmin = resolveConfiguredAdminCredentials(process.env);
+
+  if (configuredAdmin) {
+    try {
+      await enforceConfiguredAdminCredentials({
+        backendPort: opts.backendPort,
+        env: process.env,
+        fetchImpl: deps.fetch,
+      });
+      deps.log(
+        `[aionui-web] Log in with username "${configuredAdmin.username}". Password is configured from AIONUI_ADMIN_PASSWORD.`
+      );
+    } catch (err) {
+      deps.warn(
+        `[aionui-web] failed to apply configured admin credentials: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    return;
+  }
 
   let status: AuthStatus;
   try {

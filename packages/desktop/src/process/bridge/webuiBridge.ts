@@ -21,6 +21,7 @@ import {
   getDesktopWebUIStatus,
   setDesktopWebUIInitialPassword,
 } from '@process/utils/webuiConfig';
+import { enforceConfiguredAdminCredentials, resolveConfiguredAdminCredentials } from '../../../../web-cli/src/adminCredentials.js';
 
 type AdminUsernameResult = { username?: string };
 
@@ -53,6 +54,16 @@ async function maybeSeedInitialPassword(): Promise<void> {
   const port = getBackendPort();
   if (!port) {
     throw new Error('[WebUI] Cannot start: aioncore is not running (globalThis.__backendPort unset)');
+  }
+  const configuredAdmin = resolveConfiguredAdminCredentials(process.env);
+  if (configuredAdmin) {
+    await enforceConfiguredAdminCredentials({
+      backendPort: port,
+      env: process.env,
+      fetchImpl: (...args) => fetch(...args),
+    });
+    setDesktopWebUIInitialPassword(configuredAdmin.password);
+    return;
   }
   const statusRes = await fetch(`http://127.0.0.1:${port}/api/auth/status`);
   if (!statusRes.ok) {

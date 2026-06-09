@@ -17,6 +17,8 @@
  *   AIONUI_BACKEND_BIN    : absolute path to aioncore binary (else PATH lookup)
  *   AIONUI_BACKEND_BUNDLED_DIR : dir containing bundled-aioncore/<plat-arch>/binary
  *   AIONUI_OPEN_BROWSER   : "1"/"true" to force open, "0"/"false" to disable
+ *   AIONUI_ADMIN_USERNAME : admin username loaded from .env / process env
+ *   AIONUI_ADMIN_PASSWORD : admin password loaded from .env / process env
  */
 
 import { execSync } from 'child_process';
@@ -27,6 +29,11 @@ import { fileURLToPath } from 'url';
 import { createServer as createViteServer, type ViteDevServer } from 'vite';
 import { startWebHost, type WebHostHandle } from '@aionui/web-host';
 import { createRendererViteConfig } from '../packages/desktop/viteRendererConfig.js';
+import {
+  enforceConfiguredAdminCredentials,
+  loadClosestDotenvFile,
+  resolveConfiguredAdminCredentials,
+} from '../packages/web-cli/src/adminCredentials.js';
 import { openBrowserUrl, shouldAutoOpenBrowser } from '../packages/web-cli/src/browser.js';
 
 // Aligned with packages/desktop/src/common/config/constants.ts WEBUI_DEFAULT_PORT.
@@ -39,6 +46,7 @@ const BACKEND_BINARY = process.platform === 'win32' ? 'aioncore.exe' : 'aioncore
 
 const __filename = fileURLToPath(import.meta.url);
 const repoRoot = path.resolve(path.dirname(__filename), '..');
+loadClosestDotenvFile(repoRoot);
 
 const args = process.argv.slice(2);
 const has = (name: string): boolean => args.includes(name);
@@ -116,6 +124,33 @@ function resolveAllowRemote(): boolean {
   const host = process.env.AIONUI_HOST?.trim();
   if (host && ['0.0.0.0', '::', '::0'].includes(host)) return true;
   return parseBoolean(process.env.AIONUI_ALLOW_REMOTE ?? process.env.AIONUI_REMOTE);
+}
+
+function getLanIP(): string | null {
+  const nets = os.networkInterfaces();
+  for (const name of Object.keys(nets)) {
+    for (const iface of nets[name] || []) {
+      if (iface.family === 'IPv4' && !iface.internal) return iface.address;
+    }
+  }
+  return null;
+}
+
+function resolveFrontendListenHost(allowRemote: boolean): string {
+  const host = process.env.AIONUI_HOST?.trim();
+  if (host) return host;
+  return allowRemote ? '0.0.0.0' : '127.0.0.1';
+}
+
+function resolveFrontendPublicHost(allowRemote: boolean): string {
+  const hmrHost = process.env.AIONUI_HMR_HOST?.trim();
+  if (hmrHost) return hmrHost;
+
+  const host = process.env.AIONUI_HOST?.trim();
+  if (host && !['0.0.0.0', '::', '::0'].includes(host)) return host;
+
+  if (!allowRemote) return 'localhost';
+  return getLanIP() ?? 'localhost';
 }
 
 function resolveStaticDir(): string {
@@ -207,7 +242,7 @@ function resolveDevServerPort(): number {
   return 5173;
 }
 
-async function startRendererDevServer(): Promise<ViteDevServer> {
+async function startRendererDevServer(allowRemote: boolean): Promise<ViteDevServer> {
   const appVersion = readAppVersion();
   const isDevelopment = (process.env.NODE_ENV ?? 'development') === 'development';
   const enableSentrySourceMaps = !isDevelopment && !!process.env.SENTRY_AUTH_TOKEN;
@@ -226,6 +261,8 @@ async function startRendererDevServer(): Promise<ViteDevServer> {
     },
   };
   const requestedPort = resolveDevServerPort();
+  const frontendListenHost = resolveFrontendListenHost(allowRemote);
+  const frontendPublicHost = resolveFrontendPublicHost(allowRemote);
   const viteServer = await createViteServer({
     ...createRendererViteConfig({
       mode: 'development',
@@ -235,10 +272,11 @@ async function startRendererDevServer(): Promise<ViteDevServer> {
     }),
     configFile: false,
     server: {
+      host: frontendListenHost,
       port: requestedPort,
       strictPort: false,
       hmr: {
-        host: 'localhost',
+        host: frontendPublicHost,
       },
     },
   });
@@ -282,11 +320,12 @@ async function main(): Promise<void> {
   const staticDir = devMode ? path.join(repoRoot, 'out', 'renderer') : resolveStaticDir();
   const backendBin = resolveBackendBinary();
   const logDir = process.env.AIONUI_LOG_DIR ?? path.join(workDir, 'logs');
+  const frontendPublicHost = resolveFrontendPublicHost(allowRemote);
   let viteServer: ViteDevServer | null = null;
   let devServerPort: number | undefined;
 
   if (devMode) {
-    viteServer = await startRendererDevServer();
+    viteServer = await startRendererDevServer(allowRemote);
     const address = viteServer.httpServer?.address();
     if (!address || typeof address === 'string') {
       throw new Error('Vite dev server did not expose a TCP port');
@@ -297,6 +336,9 @@ async function main(): Promise<void> {
   console.log('[webui] work dir   :', workDir);
   if (devMode) {
     console.log('[webui] frontend   :', `Vite dev server on http://127.0.0.1:${devServerPort}`);
+    if (allowRemote) {
+      console.log('[webui] frontend LAN:', `Vite dev server on http://${frontendPublicHost}:${devServerPort}`);
+    }
   } else {
     console.log('[webui] static dir :', staticDir);
   }
@@ -341,42 +383,55 @@ async function main(): Promise<void> {
   console.log(`  Local  : ${handle.localUrl}`);
   if (handle.networkUrl) console.log(`  Network: ${handle.networkUrl}`);
 
-  // If SQLite has no admin yet (fresh install), seed one via backend and print
-  // the plaintext credentials. Mirrors webuiBridge.ts:maybeSeedInitialPassword
-  // for the Electron path — SQLite is now the single source of truth.
-  //
-  // Username is surfaced explicitly: legacy dev databases may have the seeded
-  // user as `system` instead of `admin`, and Electron users can rename it via
-  // Settings. Always read it from the backend rather than assuming a value.
-  try {
-    const statusRes = await fetch(`http://127.0.0.1:${handle.backendPort}/api/auth/status`);
-    if (statusRes.ok) {
-      const status = (await statusRes.json()) as { needs_setup?: boolean };
-      if (status.needs_setup === true) {
-        const resetRes = await fetch(`http://127.0.0.1:${handle.backendPort}/api/webui/reset-password`, {
-          method: 'POST',
-        });
-        if (resetRes.ok) {
-          const payload = (await resetRes.json()) as { data?: { new_password?: string } };
-          const initialPassword = payload.data?.new_password;
-          if (initialPassword) {
-            const adminUsername = await fetchAdminUsername(handle.backendPort);
-            console.log('');
-            console.log(`Initial admin username: ${adminUsername}`);
-            console.log(`Initial admin password: ${initialPassword}`);
-            console.log('(change them after first login)');
+  const configuredAdmin = resolveConfiguredAdminCredentials(process.env);
+  if (configuredAdmin) {
+    await enforceConfiguredAdminCredentials({
+      backendPort: handle.backendPort,
+      env: process.env,
+      fetchImpl: (...args) => fetch(...args),
+    });
+    console.log('');
+    console.log(`Login username: ${configuredAdmin.username}`);
+    console.log('Login password: configured from .env via AIONUI_ADMIN_PASSWORD');
+  } else {
+
+    // If SQLite has no admin yet (fresh install), seed one via backend and print
+    // the plaintext credentials. Mirrors webuiBridge.ts:maybeSeedInitialPassword
+    // for the Electron path — SQLite is now the single source of truth.
+    //
+    // Username is surfaced explicitly: legacy dev databases may have the seeded
+    // user as `system` instead of `admin`, and Electron users can rename it via
+    // Settings. Always read it from the backend rather than assuming a value.
+    try {
+      const statusRes = await fetch(`http://127.0.0.1:${handle.backendPort}/api/auth/status`);
+      if (statusRes.ok) {
+        const status = (await statusRes.json()) as { needs_setup?: boolean };
+        if (status.needs_setup === true) {
+          const resetRes = await fetch(`http://127.0.0.1:${handle.backendPort}/api/webui/reset-password`, {
+            method: 'POST',
+          });
+          if (resetRes.ok) {
+            const payload = (await resetRes.json()) as { data?: { new_password?: string } };
+            const initialPassword = payload.data?.new_password;
+            if (initialPassword) {
+              const adminUsername = await fetchAdminUsername(handle.backendPort);
+              console.log('');
+              console.log(`Initial admin username: ${adminUsername}`);
+              console.log(`Initial admin password: ${initialPassword}`);
+              console.log('(change them after first login)');
+            }
           }
+        } else {
+          // Credentials already exist; just remind the user what username to use.
+          const adminUsername = await fetchAdminUsername(handle.backendPort);
+          console.log('');
+          console.log(`Login username: ${adminUsername}`);
+          console.log('(forgot the password? run `bun run resetpass` to generate a new one)');
         }
-      } else {
-        // Credentials already exist; just remind the user what username to use.
-        const adminUsername = await fetchAdminUsername(handle.backendPort);
-        console.log('');
-        console.log(`Login username: ${adminUsername}`);
-        console.log('(forgot the password? run `bun run resetpass` to generate a new one)');
       }
+    } catch (err) {
+      console.warn('[webui] could not query admin credentials:', err);
     }
-  } catch (err) {
-    console.warn('[webui] could not query admin credentials:', err);
   }
 
   if (autoOpenBrowser) {

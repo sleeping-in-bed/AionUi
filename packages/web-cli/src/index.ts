@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadClosestDotenvFile } from './adminCredentials.js';
 import { openBrowserUrl, shouldAutoOpenBrowser } from './browser.js';
 import { ensureAdminPassword } from './ensureAdminPassword.js';
 
@@ -33,6 +34,7 @@ function resolveCliRoot(): string {
 }
 
 const cliRoot = resolveCliRoot();
+loadClosestDotenvFile(cliRoot);
 
 // `isPackaged` mirrors AppMetadata.isPackaged: true when running as the
 // bun-compiled single-file binary inside a release tarball. Only the
