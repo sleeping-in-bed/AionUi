@@ -2,7 +2,8 @@
  * Prepare aioncore binary for packaging.
  *
  * Resolution order:
- *  1. GitHub release download (requires version or defaults to "latest")
+ *  1. Local AionCore checkout (AIONUI_BACKEND_REPO_DIR or ../AionCore)
+ *  2. GitHub release download (requires version or defaults to "latest")
  *
  * Output: {projectRoot}/resources/bundled-aioncore/{platform}-{arch}/
  *   - aioncore[.exe]
@@ -54,6 +55,10 @@ function getBinaryName(platform) {
   return platform === 'win32' ? 'aioncore.exe' : 'aioncore';
 }
 
+function getNativeRuntimeKey() {
+  return `${process.platform}-${process.arch}`;
+}
+
 function prepareManagedResources(binaryPath, targetDir) {
   const bundleOut = path.join(targetDir, 'managed-resources');
   const dataDir = path.join(targetDir, '.prepare-data');
@@ -74,6 +79,95 @@ function prepareManagedResources(binaryPath, targetDir) {
 
   removeDirectorySafe(dataDir);
   return bundleOut;
+}
+
+function readLocalRepoVersion(repoDir) {
+  try {
+    const cargoToml = fs.readFileSync(path.join(repoDir, 'Cargo.toml'), 'utf-8');
+    const match = cargoToml.match(/\[workspace\.package\][\s\S]*?version\s*=\s*"([^"]+)"/);
+    if (match?.[1]) {
+      return `v${match[1]}`;
+    }
+  } catch {
+    // fall through
+  }
+
+  return 'local';
+}
+
+function readGitCommit(repoDir) {
+  try {
+    return execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: repoDir,
+      encoding: 'utf-8',
+      timeout: 15000,
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function resolveLocalRepoDir(projectRoot) {
+  const envOverride = process.env.AIONUI_BACKEND_REPO_DIR?.trim();
+  const candidate = envOverride ? path.resolve(envOverride) : path.resolve(projectRoot, '..', 'AionCore');
+  const cargoToml = path.join(candidate, 'Cargo.toml');
+  const appCargoToml = path.join(candidate, 'crates', 'aionui-app', 'Cargo.toml');
+  const isRepo = fs.existsSync(cargoToml) && fs.existsSync(appCargoToml);
+
+  if (isRepo) {
+    return candidate;
+  }
+
+  if (envOverride) {
+    throw new Error(`AIONUI_BACKEND_REPO_DIR is not a valid AionCore checkout: ${candidate}`);
+  }
+
+  return null;
+}
+
+function resolveCargoProfile() {
+  const raw = process.env.AIONUI_BACKEND_CARGO_PROFILE?.trim().toLowerCase();
+  if (!raw) return 'release';
+  if (raw === 'release') return 'release';
+  if (raw === 'debug' || raw === 'dev') return 'debug';
+  throw new Error(`Unsupported AIONUI_BACKEND_CARGO_PROFILE: ${raw}`);
+}
+
+function buildFromLocalRepo(repoDir, runtimeKey, binaryName) {
+  const nativeRuntimeKey = getNativeRuntimeKey();
+  if (runtimeKey !== nativeRuntimeKey) {
+    throw new Error(`Local AionCore checkout only supports native builds (${nativeRuntimeKey}), got ${runtimeKey}`);
+  }
+
+  const cargoProfile = resolveCargoProfile();
+  const cargoArgs = ['build', '--locked', '-p', 'aionui-app'];
+  if (cargoProfile === 'release') {
+    cargoArgs.splice(2, 0, '--release');
+  }
+
+  console.log(`  Building local AionCore checkout at ${repoDir} [profile=${cargoProfile}]`);
+  execFileSync('cargo', cargoArgs, {
+    cwd: repoDir,
+    stdio: 'inherit',
+    env: process.env,
+  });
+
+  const targetProfile = cargoProfile === 'release' ? 'release' : 'debug';
+  const binaryPath = path.join(repoDir, 'target', targetProfile, binaryName);
+  if (!fs.existsSync(binaryPath)) {
+    throw new Error(`Built aioncore binary not found: ${binaryPath}`);
+  }
+
+  return {
+    binaryPath,
+    sourceType: 'local-build',
+    version: readLocalRepoVersion(repoDir),
+    sourceDetail: {
+      repoDir,
+      cargoProfile,
+      gitCommit: readGitCommit(repoDir),
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -224,24 +318,11 @@ function prepareAioncore(options) {
   const { projectRoot, platform, arch, version = 'latest' } = options;
   const runtimeKey = `${platform}-${arch}`;
 
-  // Resolve the actual version tag — asset filenames include the tag
-  let tag;
-  if (version === 'latest') {
-    const resolved = resolveLatestTag();
-    if (!resolved) {
-      throw new Error('Failed to resolve latest aioncore release tag from GitHub API');
-    }
-    tag = resolved;
-    console.log(`Resolved aioncore "latest" → ${tag}`);
-  } else {
-    tag = version.startsWith('v') ? version : `v${version}`;
-  }
-
   const targetDir = path.join(projectRoot, 'resources', 'bundled-aioncore', runtimeKey);
   const binaryName = getBinaryName(platform);
   const targetBinaryPath = path.join(targetDir, binaryName);
 
-  console.log(`Preparing aioncore for ${runtimeKey} (version: ${tag})`);
+  console.log(`Preparing aioncore for ${runtimeKey}`);
 
   removeDirectorySafe(targetDir);
   ensureDirectory(targetDir);
@@ -250,15 +331,41 @@ function prepareAioncore(options) {
   let sourceType = 'none';
   let sourceDetail = {};
   let tempDir = null;
+  let resolvedVersion = null;
 
-  // 1. Download from GitHub releases
+  const localRepoDir = resolveLocalRepoDir(projectRoot);
+
+  // 1. Build from local AionCore checkout
+  if (localRepoDir) {
+    const result = buildFromLocalRepo(localRepoDir, runtimeKey, binaryName);
+    sourcePath = result.binaryPath;
+    sourceType = result.sourceType;
+    sourceDetail = result.sourceDetail;
+    resolvedVersion = result.version;
+    console.log(`  Using local AionCore checkout`);
+  }
+
+  // 2. Download from GitHub releases
   if (!sourcePath) {
+    let tag;
+    if (version === 'latest') {
+      const resolved = resolveLatestTag();
+      if (!resolved) {
+        throw new Error('Failed to resolve latest aioncore release tag from GitHub API');
+      }
+      tag = resolved;
+      console.log(`Resolved aioncore "latest" → ${tag}`);
+    } else {
+      tag = version.startsWith('v') ? version : `v${version}`;
+    }
+
     try {
       const result = downloadAndExtract(platform, arch, tag);
       sourcePath = result.binaryPath;
       tempDir = result.tempDir;
       sourceType = 'download';
       sourceDetail = { url: result.url };
+      resolvedVersion = tag;
       console.log(`  Downloaded from GitHub releases`);
     } catch (error) {
       console.warn(`  Download failed: ${error.message}`);
@@ -277,7 +384,7 @@ function prepareAioncore(options) {
     const manifest = {
       platform,
       arch,
-      version: tag,
+      version: resolvedVersion ?? 'unknown',
       generatedAt: new Date().toISOString(),
       sourceType,
       source: sourceDetail,

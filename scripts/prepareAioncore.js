@@ -3,12 +3,15 @@
  *
  * Reads environment variables and invokes the shared module.
  *
- * Version resolution order:
- *  1. AIONUI_BACKEND_VERSION env (for ad-hoc overrides)
- *  2. "aioncoreVersion" field in repo-root package.json (the pin)
- *  3. 'latest' (fallback; not recommended for reproducible builds)
+ * Source resolution order:
+ *  1. Local AionCore checkout (AIONUI_BACKEND_REPO_DIR or ../AionCore)
+ *  2. AIONUI_BACKEND_VERSION env (for ad-hoc release overrides)
+ *  3. "aioncoreVersion" field in repo-root package.json (the pin)
+ *  4. 'latest' (fallback; not recommended for reproducible builds)
  *
  * Environment variables:
+ *  - AIONUI_BACKEND_REPO_DIR: path to a local AionCore checkout
+ *  - AIONUI_BACKEND_CARGO_PROFILE: local checkout build profile (debug/release)
  *  - AIONUI_BACKEND_VERSION: override the pinned version
  *  - AIONUI_BACKEND_ARCH: target architecture (default: process.arch)
  *  - GH_TOKEN / GITHUB_TOKEN: GitHub API token (for rate limiting)
