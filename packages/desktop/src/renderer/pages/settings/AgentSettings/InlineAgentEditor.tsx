@@ -4,10 +4,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { CustomAgentAdvancedOverrides } from '@/common/types/platform/acpTypes';
+import type { CustomAgentAdvancedOverrides, CustomAgentBackend } from '@/common/types/platform/acpTypes';
 import type { AgentMetadata } from '@/renderer/utils/model/agentTypes';
 import { acpConversation } from '@/common/adapter/ipcBridge';
-import { Alert, Avatar, Button, Collapse, Input, Typography } from '@arco-design/web-react';
+import { Alert, Avatar, Button, Collapse, Input, Select, Typography } from '@arco-design/web-react';
 import { Plus, Delete, CheckOne, CloseOne } from '@icon-park/react';
 import EmojiPicker from '@/renderer/components/chat/EmojiPicker';
 import CodeMirror from '@uiw/react-codemirror';
@@ -39,6 +39,7 @@ export interface CustomAgentDraft {
   icon?: string;
   /** Spawn command for the CLI. */
   command: string;
+  backend?: CustomAgentBackend;
   enabled: boolean;
   args?: string[];
   env?: Array<{ name: string; value: string; description?: string }>;
@@ -49,6 +50,24 @@ interface InlineAgentEditorProps {
   agent?: AgentMetadata | null;
   onSave: (agent: CustomAgentDraft) => void;
   onCancel: () => void;
+}
+
+const CUSTOM_AGENT_BACKEND_OPTIONS: Array<{ value: CustomAgentBackend; label: string }> = [
+  { value: 'claude', label: 'Claude' },
+  { value: 'codex', label: 'Codex' },
+  { value: 'cursor', label: 'Cursor' },
+  { value: 'gemini', label: 'Gemini' },
+  { value: 'goose', label: 'Goose' },
+  { value: 'hermes', label: 'Hermes' },
+  { value: 'kimi', label: 'Kimi' },
+  { value: 'opencode', label: 'OpenCode' },
+  { value: 'qwen', label: 'Qwen' },
+  { value: 'snow', label: 'Snow' },
+];
+
+function normalizeCustomAgentBackend(value: string | undefined): CustomAgentBackend | undefined {
+  if (!value) return undefined;
+  return CUSTOM_AGENT_BACKEND_OPTIONS.some((option) => option.value === value) ? (value as CustomAgentBackend) : undefined;
 }
 
 /** Parse a space-separated argument string into an array, respecting quotes. */
@@ -125,6 +144,7 @@ const InlineAgentEditor: React.FC<InlineAgentEditorProps> = ({ agent, onSave, on
   const [avatar, setAvatar] = useState('🤖');
   const [name, setName] = useState('');
   const [command, setCommand] = useState('');
+  const [backend, setBackend] = useState<CustomAgentBackend | undefined>(undefined);
   const [argsString, setArgsString] = useState('');
   const [envVars, setEnvVars] = useState<EnvVar[]>([]);
   // `advanced` mirrors the backend `CustomAgentAdvancedOverrides` schema
@@ -167,6 +187,7 @@ const InlineAgentEditor: React.FC<InlineAgentEditorProps> = ({ agent, onSave, on
       setAvatar(agent.icon || '🤖');
       setName(agent.name || '');
       setCommand(agent.command || '');
+      setBackend(normalizeCustomAgentBackend(agent.backend));
       setArgsString(agent.args?.join(' ') || '');
       setEnvVars(objectToEnvVars(agentEnvToRecord(agent.env)));
       setAdvanced(agentToAdvanced(agent));
@@ -174,6 +195,7 @@ const InlineAgentEditor: React.FC<InlineAgentEditorProps> = ({ agent, onSave, on
       setAvatar('🤖');
       setName('');
       setCommand('');
+      setBackend(undefined);
       setArgsString('');
       setEnvVars([]);
       setAdvanced({});
@@ -227,6 +249,10 @@ const InlineAgentEditor: React.FC<InlineAgentEditorProps> = ({ agent, onSave, on
   const handleArgsChange = useCallback((v: string) => {
     isJsonEditingRef.current = false;
     setArgsString(v);
+  }, []);
+  const handleBackendChange = useCallback((value: string) => {
+    isJsonEditingRef.current = false;
+    setBackend(value ? (value as CustomAgentBackend) : undefined);
   }, []);
 
   const addEnvVar = useCallback(() => {
@@ -291,13 +317,14 @@ const InlineAgentEditor: React.FC<InlineAgentEditorProps> = ({ agent, onSave, on
       name: name.trim() || 'Custom Agent',
       icon: avatar,
       command: command.trim(),
+      backend,
       enabled: agent?.enabled !== false,
       args: parsedArgs.length > 0 ? parsedArgs : undefined,
       env: envEntries.length > 0 ? envEntries : undefined,
       advanced: hasAdvanced ? advanced : undefined,
     };
     onSave(draft);
-  }, [agent, name, avatar, command, argsString, envVars, advanced, onSave]);
+  }, [agent, name, avatar, command, backend, argsString, envVars, advanced, onSave]);
 
   const isSubmitDisabled = !name.trim() || !command.trim();
   const isTestDisabled = !command.trim() || testStatus === 'testing';
@@ -355,6 +382,27 @@ const InlineAgentEditor: React.FC<InlineAgentEditorProps> = ({ agent, onSave, on
         />
         <Typography.Text type='secondary' className={fieldHelpClassName}>
           {t('settings.argsHelp')}
+        </Typography.Text>
+      </div>
+
+      {/* Backend */}
+      <div>
+        <Typography.Text className={fieldLabelClassName}>{t('settings.agentBackendLabel')}</Typography.Text>
+        <Select
+          size='large'
+          allowClear
+          value={backend}
+          onChange={handleBackendChange}
+          placeholder={t('settings.agentBackendPlaceholder')}
+        >
+          {CUSTOM_AGENT_BACKEND_OPTIONS.map((option) => (
+            <Select.Option key={option.value} value={option.value}>
+              {option.label}
+            </Select.Option>
+          ))}
+        </Select>
+        <Typography.Text type='secondary' className={fieldHelpClassName}>
+          {t('settings.agentBackendHelp')}
         </Typography.Text>
       </div>
 

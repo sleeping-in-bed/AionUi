@@ -17,6 +17,19 @@ export interface CustomAgentAdvancedOverrides {
   description?: string;
 }
 
+/** Optional vendor/backend hint for custom ACP agents. */
+export type CustomAgentBackend =
+  | 'claude'
+  | 'codex'
+  | 'cursor'
+  | 'gemini'
+  | 'goose'
+  | 'hermes'
+  | 'kimi'
+  | 'opencode'
+  | 'qwen'
+  | 'snow';
+
 // ── Initialize response types (from ACP spec) ──────────────────────────
 
 /**

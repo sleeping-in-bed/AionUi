@@ -38,6 +38,7 @@ const LocalAgents: React.FC = () => {
       const body = {
         name: draft.name,
         command: draft.command,
+        backend: draft.backend,
         icon: draft.icon,
         args: draft.args,
         env: draft.env,

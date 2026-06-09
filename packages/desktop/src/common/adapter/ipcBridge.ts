@@ -32,7 +32,7 @@ import type {
   UpdateAssistantRequest,
 } from '../types/agent/assistantTypes';
 import type { PreviewHistoryTarget, PreviewSnapshotInfo } from '../types/office/preview';
-import type { AcpModelInfo } from '../types/platform/acpTypes';
+import type { AcpModelInfo, CustomAgentBackend } from '../types/platform/acpTypes';
 import type {
   CreateProviderRequest,
   FetchModelsAnonymousRequest,
@@ -755,6 +755,7 @@ export const acpConversation = {
     {
       name: string;
       command: string;
+      backend?: CustomAgentBackend;
       icon?: string;
       args?: string[];
       env?: Array<{ name: string; value: string; description?: string }>;
@@ -772,6 +773,7 @@ export const acpConversation = {
       id: string;
       name: string;
       command: string;
+      backend?: CustomAgentBackend;
       icon?: string;
       args?: string[];
       env?: Array<{ name: string; value: string; description?: string }>;
