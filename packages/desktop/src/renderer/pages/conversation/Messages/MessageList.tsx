@@ -15,7 +15,7 @@ import MessageAcpPermission from '@renderer/pages/conversation/Messages/acp/Mess
 import MessagePermission from './components/MessagePermission';
 import MessageAcpToolCall from '@renderer/pages/conversation/Messages/acp/MessageAcpToolCall';
 import classNames from 'classnames';
-import React, { createContext, useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useLocation } from 'react-router-dom';
 import { uuid } from '@renderer/utils/common';
@@ -95,6 +95,53 @@ const highlightStyle: React.CSSProperties = {
   boxShadow: '0 0 0 1px var(--color-aou-6-brand) inset',
   borderRadius: '12px',
 };
+
+const SCRUBBER_TRACK_VERTICAL_PADDING = 18;
+const SCRUBBER_MIN_THUMB_HEIGHT = 44;
+
+type ScrollScrubberState = {
+  visible: boolean;
+  trackHeight: number;
+  thumbHeight: number;
+  thumbTop: number;
+};
+
+const HIDDEN_SCRUBBER_STATE: ScrollScrubberState = {
+  visible: false,
+  trackHeight: 0,
+  thumbHeight: 0,
+  thumbTop: 0,
+};
+
+function buildScrollScrubberState(scroller: HTMLDivElement | null): ScrollScrubberState {
+  if (!scroller) {
+    return HIDDEN_SCRUBBER_STATE;
+  }
+
+  const { clientHeight, scrollHeight, scrollTop } = scroller;
+  const trackHeight = Math.max(clientHeight - SCRUBBER_TRACK_VERTICAL_PADDING * 2, 0);
+  const maxScrollTop = Math.max(scrollHeight - clientHeight, 0);
+  if (trackHeight <= 0 || maxScrollTop <= 0) {
+    return {
+      visible: false,
+      trackHeight,
+      thumbHeight: trackHeight,
+      thumbTop: 0,
+    };
+  }
+
+  const rawThumbHeight = (clientHeight / scrollHeight) * trackHeight;
+  const thumbHeight = Math.min(Math.max(rawThumbHeight, SCRUBBER_MIN_THUMB_HEIGHT), trackHeight);
+  const maxThumbTravel = Math.max(trackHeight - thumbHeight, 0);
+  const thumbTop = maxThumbTravel === 0 ? 0 : (scrollTop / maxScrollTop) * maxThumbTravel;
+
+  return {
+    visible: true,
+    trackHeight,
+    thumbHeight,
+    thumbTop,
+  };
+}
 
 const getUnhandledMessageType = (_message: never): string => 'unknown';
 
@@ -241,7 +288,14 @@ const MessageList: React.FC<{ className?: string; emptySlot?: React.ReactNode }>
   const locationState = (location.state || {}) as ConversationLocationState;
   const targetMessageId = locationState.targetMessageId;
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | undefined>();
+  const [scrollScrubber, setScrollScrubber] = useState<ScrollScrubberState>(HIDDEN_SCRUBBER_STATE);
   const handledTargetKeyRef = useRef<string>('');
+  const scrollerElRef = useRef<HTMLDivElement | null>(null);
+  const contentElRef = useRef<HTMLDivElement | null>(null);
+  const scrubberTrackRef = useRef<HTMLDivElement | null>(null);
+  const scrubberThumbRef = useRef<HTMLDivElement | null>(null);
+  const scrubberDragOffsetRef = useRef(0);
+  const scrubberDraggingRef = useRef(false);
 
   // Pre-process message list to group tool outputs into summary cards
   const processedList = useMemo(() => {
@@ -359,6 +413,156 @@ const MessageList: React.FC<{ className?: string; emptySlot?: React.ReactNode }>
     messages: list,
     itemCount: processedList.length,
   });
+
+  const updateScrollScrubber = useCallback((element: HTMLDivElement | null) => {
+    setScrollScrubber(buildScrollScrubberState(element));
+  }, []);
+
+  const handleCombinedScrollerRef = useCallback(
+    (element: HTMLDivElement | null) => {
+      handleScrollerRef(element);
+      scrollerElRef.current = element;
+    },
+    [handleScrollerRef]
+  );
+
+  const handleCombinedContentRef = useCallback(
+    (element: HTMLDivElement | null) => {
+      handleContentRef(element);
+      contentElRef.current = element;
+    },
+    [handleContentRef]
+  );
+
+  const handleCombinedScroll = useCallback(
+    (event: React.UIEvent<HTMLDivElement>) => {
+      handleScroll(event);
+      updateScrollScrubber(event.currentTarget);
+    },
+    [handleScroll, updateScrollScrubber]
+  );
+
+  const applyScrubberScroll = useCallback(
+    (clientY: number) => {
+      const scrollerEl = scrollerElRef.current;
+      if (!scrollerEl || !scrubberTrackRef.current) {
+        return;
+      }
+
+      const maxScrollTop = Math.max(scrollerEl.scrollHeight - scrollerEl.clientHeight, 0);
+      const maxThumbTravel = Math.max(scrollScrubber.trackHeight - scrollScrubber.thumbHeight, 0);
+      if (maxScrollTop <= 0 || maxThumbTravel <= 0) {
+        scrollerEl.scrollTop = 0;
+        updateScrollScrubber(scrollerEl);
+        return;
+      }
+
+      const rect = scrubberTrackRef.current.getBoundingClientRect();
+      const nextThumbTop = Math.min(
+        Math.max(clientY - rect.top - scrubberDragOffsetRef.current, 0),
+        maxThumbTravel
+      );
+      scrollerEl.scrollTop = (nextThumbTop / maxThumbTravel) * maxScrollTop;
+      updateScrollScrubber(scrollerEl);
+    },
+    [scrollScrubber.thumbHeight, scrollScrubber.trackHeight, updateScrollScrubber]
+  );
+
+  const handleScrubberPointerMove = useCallback(
+    (event: PointerEvent) => {
+      if (!scrubberDraggingRef.current) {
+        return;
+      }
+      applyScrubberScroll(event.clientY);
+    },
+    [applyScrubberScroll]
+  );
+
+  const stopScrubberDrag = useCallback(() => {
+    if (!scrubberDraggingRef.current) {
+      return;
+    }
+    scrubberDraggingRef.current = false;
+    document.body.style.userSelect = '';
+    window.removeEventListener('pointermove', handleScrubberPointerMove);
+    window.removeEventListener('pointerup', stopScrubberDrag);
+  }, [handleScrubberPointerMove]);
+
+  const startScrubberDrag = useCallback(
+    (clientY: number, centerThumb: boolean) => {
+      if (!scrubberTrackRef.current) {
+        return;
+      }
+
+      handlePointerDown();
+      scrubberDraggingRef.current = true;
+      const rect = scrubberTrackRef.current.getBoundingClientRect();
+      scrubberDragOffsetRef.current = centerThumb
+        ? scrollScrubber.thumbHeight / 2
+        : clientY - rect.top - scrollScrubber.thumbTop;
+      document.body.style.userSelect = 'none';
+      applyScrubberScroll(clientY);
+      window.addEventListener('pointermove', handleScrubberPointerMove);
+      window.addEventListener('pointerup', stopScrubberDrag);
+    },
+    [
+      applyScrubberScroll,
+      handlePointerDown,
+      handleScrubberPointerMove,
+      scrollScrubber.thumbHeight,
+      scrollScrubber.thumbTop,
+      stopScrubberDrag,
+    ]
+  );
+
+  const handleScrubberTrackPointerDown = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      startScrubberDrag(event.clientY, event.target === scrubberTrackRef.current);
+    },
+    [startScrubberDrag]
+  );
+
+  const handleScrubberThumbPointerDown = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      event.stopPropagation();
+      startScrubberDrag(event.clientY, false);
+    },
+    [startScrubberDrag]
+  );
+
+  useEffect(() => {
+    updateScrollScrubber(scrollerElRef.current);
+  }, [processedList.length, updateScrollScrubber]);
+
+  useEffect(() => {
+    const scrollerEl = scrollerElRef.current;
+    const contentEl = contentElRef.current;
+    if (!scrollerEl) {
+      return;
+    }
+
+    const observer = new ResizeObserver(() => {
+      updateScrollScrubber(scrollerEl);
+    });
+    observer.observe(scrollerEl);
+    if (contentEl) {
+      observer.observe(contentEl);
+    }
+
+    return () => observer.disconnect();
+  }, [processedList.length, updateScrollScrubber]);
+
+  useEffect(() => {
+    return () => {
+      if (scrubberDraggingRef.current) {
+        document.body.style.userSelect = '';
+      }
+      window.removeEventListener('pointermove', handleScrubberPointerMove);
+      window.removeEventListener('pointerup', stopScrubberDrag);
+    };
+  }, [handleScrubberPointerMove, stopScrubberDrag]);
 
   useEffect(() => {
     if (!targetMessageId || processedList.length === 0) {
@@ -490,17 +694,18 @@ const MessageList: React.FC<{ className?: string; emptySlot?: React.ReactNode }>
       <Image.PreviewGroup actionsLayout={['zoomIn', 'zoomOut', 'originalSize', 'rotateLeft', 'rotateRight']}>
         <ImagePreviewContext.Provider value={{ inPreviewGroup: true }}>
           <div
-            ref={handleScrollerRef}
+            ref={handleCombinedScrollerRef}
+            id='message-list-scroller'
             data-testid='message-list-scroller'
             // Break out of the parent's 20px horizontal padding so the scrollbar hugs the
             // window edge, while re-applying that padding inside to keep message content inset.
             className='flex-1 h-full overflow-y-auto pb-10px box-border -mx-20px px-20px'
             style={{ overflowAnchor: 'none' }}
             onPointerDown={handlePointerDown}
-            onScroll={handleScroll}
+            onScroll={handleCombinedScroll}
             onWheel={handleWheel}
           >
-            <div ref={handleContentRef} data-testid='message-list-content' style={{ overflowAnchor: 'none' }}>
+            <div ref={handleCombinedContentRef} data-testid='message-list-content' style={{ overflowAnchor: 'none' }}>
               <div className='h-10px' />
               {processedList.map((item, index) => (
                 <React.Fragment key={getProcessedItemAnchorId(item) || index}>{renderItem(index, item)}</React.Fragment>
@@ -510,6 +715,41 @@ const MessageList: React.FC<{ className?: string; emptySlot?: React.ReactNode }>
           </div>
         </ImagePreviewContext.Provider>
       </Image.PreviewGroup>
+
+      <div
+        ref={scrubberTrackRef}
+        data-testid='message-list-scrubber-track'
+        className={classNames(
+          'hidden md:flex absolute top-18px bottom-18px right-2px z-20 w-16px items-start justify-center rounded-full transition-opacity',
+          scrollScrubber.visible ? 'opacity-100' : 'opacity-0 pointer-events-none'
+        )}
+        onPointerDown={handleScrubberTrackPointerDown}
+        style={{
+          background: 'color-mix(in srgb, var(--color-fill-2) 82%, transparent)',
+          border: '1px solid color-mix(in srgb, var(--color-border-2) 88%, transparent)',
+        }}
+      >
+        <div
+          ref={scrubberThumbRef}
+          data-testid='message-list-scrubber-thumb'
+          role='scrollbar'
+          aria-controls='message-list-scroller'
+          aria-orientation='vertical'
+          aria-valuemin={0}
+          aria-valuemax={Math.max((scrollerElRef.current?.scrollHeight ?? 0) - (scrollerElRef.current?.clientHeight ?? 0), 0)}
+          aria-valuenow={Math.round(scrollerElRef.current?.scrollTop ?? 0)}
+          className='absolute left-2px right-2px rounded-full shadow-sm'
+          onPointerDown={handleScrubberThumbPointerDown}
+          style={{
+            top: `${scrollScrubber.thumbTop}px`,
+            height: `${scrollScrubber.thumbHeight}px`,
+            minHeight: `${Math.min(SCRUBBER_MIN_THUMB_HEIGHT, scrollScrubber.trackHeight || SCRUBBER_MIN_THUMB_HEIGHT)}px`,
+            background: 'color-mix(in srgb, rgba(var(--primary-6), 0.74) 82%, white)',
+            border: '1px solid color-mix(in srgb, rgba(var(--primary-6), 0.68) 90%, transparent)',
+            touchAction: 'none',
+          }}
+        />
+      </div>
 
       {showScrollButton && (
         <>

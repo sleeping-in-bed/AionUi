@@ -11,17 +11,20 @@ import type { IMessageText } from '@/common/chat/chatLib';
 import { MessageListProvider } from '@/renderer/pages/conversation/Messages/hooks';
 import MessageList from '@/renderer/pages/conversation/Messages/MessageList';
 
-let resizeObserverCallback: ResizeObserverCallback | null = null;
+const resizeObserverCallbacks = new Set<ResizeObserverCallback>();
 
 class ResizeObserverMock {
   constructor(callback: ResizeObserverCallback) {
-    resizeObserverCallback = callback;
+    resizeObserverCallbacks.add(callback);
+    this.callback = callback;
   }
+
+  private readonly callback: ResizeObserverCallback;
 
   observe() {}
   unobserve() {}
   disconnect() {
-    resizeObserverCallback = null;
+    resizeObserverCallbacks.delete(this.callback);
   }
 }
 
@@ -178,7 +181,9 @@ function setScrollableMetrics(
 
 function flushResizeObserver(): void {
   act(() => {
-    resizeObserverCallback?.([], {} as ResizeObserver);
+    resizeObserverCallbacks.forEach((callback) => {
+      callback([], {} as ResizeObserver);
+    });
     vi.runAllTimers();
   });
 }
@@ -189,7 +194,7 @@ describe('MessageList streaming scroll behavior', () => {
     vi.setSystemTime(new Date('2026-05-26T12:00:00.000Z'));
     vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => window.setTimeout(() => callback(0), 0));
     vi.stubGlobal('cancelAnimationFrame', (handle: number) => window.clearTimeout(handle));
-    resizeObserverCallback = null;
+    resizeObserverCallbacks.clear();
   });
 
   afterEach(() => {
@@ -236,6 +241,46 @@ describe('MessageList streaming scroll behavior', () => {
       .filter((top): top is number => typeof top === 'number');
 
     expect(scrollTargets).toEqual([680, 760, 840]);
+  });
+
+  it('renders a draggable scrubber that updates scrollTop while dragging', () => {
+    const firstMessage = createTextMessage('hello');
+    render(
+      <Wrapper messages={[firstMessage]}>
+        <MessageList />
+      </Wrapper>
+    );
+
+    const scroller = screen.getByTestId('message-list-scroller') as HTMLDivElement;
+    setScrollableMetrics(scroller, {
+      clientHeight: 400,
+      scrollHeight: 1000,
+      scrollTop: 0,
+    });
+    flushResizeObserver();
+
+    const track = screen.getByTestId('message-list-scrubber-track') as HTMLDivElement;
+    const thumb = screen.getByTestId('message-list-scrubber-thumb') as HTMLDivElement;
+    vi.spyOn(track, 'getBoundingClientRect').mockReturnValue({
+      x: 0,
+      y: 0,
+      top: 0,
+      left: 0,
+      right: 16,
+      bottom: 364,
+      width: 16,
+      height: 364,
+      toJSON: () => ({}),
+    });
+
+    act(() => {
+      fireEvent.pointerDown(thumb, { clientY: 10 });
+      fireEvent.pointerMove(window, { clientY: 220 });
+      fireEvent.pointerUp(window);
+    });
+
+    expect(scroller.scrollTop).toBeGreaterThan(0);
+    expect(Number(thumb.getAttribute('aria-valuenow'))).toBe(Math.round(scroller.scrollTop));
   });
 
   it('stops auto-following streamed updates after the user scrolls up', () => {
