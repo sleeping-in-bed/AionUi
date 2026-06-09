@@ -4,6 +4,7 @@ import { isBackendHttpError } from '@/common/adapter/httpBridge';
 import { isSideQuestionSupported } from '@/common/chat/sideQuestion';
 import { parseError, uuid } from '@/common/utils';
 import AgentModeSelector from '@/renderer/components/agent/AgentModeSelector';
+import ContextUsageIndicator, { formatTokenCount } from '@/renderer/components/agent/ContextUsageIndicator';
 import CommandQueuePanel from '@/renderer/components/chat/CommandQueuePanel';
 import MobileActionSheet, {
   type MobileActionSheetEntry,
@@ -48,6 +49,59 @@ import { useTranslation } from 'react-i18next';
 import { buildSendFailureError } from './buildSendFailureError';
 import { useAcpInitialMessage } from './useAcpInitialMessage';
 import type { UseAcpMessageReturn } from './useAcpMessage';
+
+type CodexRateLimitWindow = {
+  used_percent: number;
+  window_duration_mins: number;
+  resets_at: number;
+};
+
+type CodexStatusResponse = {
+  available: boolean;
+  checked_at_ms: number;
+  requires_openai_auth: boolean;
+  auth_mode?: string | null;
+  plan_type?: string | null;
+  rate_limits?: {
+    primary?: CodexRateLimitWindow | null;
+    secondary?: CodexRateLimitWindow | null;
+    rate_limit_reached_type?: string | null;
+  } | null;
+  error?: string | null;
+};
+
+const CODEX_STATUS_POLL_MS = 60_000;
+
+function formatCodexWindowLabel(windowDurationMins: number): string {
+  if (windowDurationMins === 300) return '5h';
+  if (windowDurationMins === 10_080) return 'week';
+  if (windowDurationMins % 60 === 0 && windowDurationMins >= 60) {
+    return `${Math.round(windowDurationMins / 60)}h`;
+  }
+  return `${windowDurationMins}m`;
+}
+
+function getLimitChipStyle(remainingPercent: number): React.CSSProperties {
+  if (remainingPercent <= 5) {
+    return {
+      color: 'rgb(var(--danger-6))',
+      backgroundColor: 'var(--color-danger-light-1)',
+      borderColor: 'rgb(var(--danger-3))',
+    };
+  }
+  if (remainingPercent <= 20) {
+    return {
+      color: 'rgb(var(--warning-6))',
+      backgroundColor: 'var(--color-warning-light-1)',
+      borderColor: 'rgb(var(--warning-3))',
+    };
+  }
+  return {
+    color: 'rgb(var(--success-6))',
+    backgroundColor: 'var(--color-success-light-1)',
+    borderColor: 'rgb(var(--success-3))',
+  };
+}
 
 const useAcpSendBoxDraft = getSendBoxDraftHook('acp', {
   _type: 'acp',
@@ -99,8 +153,16 @@ const AcpSendBox: React.FC<{
   workspacePath?: string;
   messageState: UseAcpMessageReturn;
 }> = ({ conversation_id, backend, session_mode, agent_name, workspacePath, messageState }) => {
-  const { aiProcessing, setAiProcessing, resetState, hasThinkingMessage, slashCommands, fetchSlashCommands } =
-    messageState;
+  const {
+    aiProcessing,
+    setAiProcessing,
+    resetState,
+    hasThinkingMessage,
+    slashCommands,
+    fetchSlashCommands,
+    tokenUsage,
+    context_limit,
+  } = messageState;
   const { t } = useTranslation();
   const teamPermission = useTeamPermission();
   // In team mode, all agents show the permission mode selector (members don't propagate)
@@ -121,6 +183,7 @@ const AcpSendBox: React.FC<{
     }));
   const [isMobileSheetOpen, setIsMobileSheetOpen] = useState(false);
   const [currentMode, setCurrentMode] = useState<string | undefined>(session_mode);
+  const [codexStatus, setCodexStatus] = useState<CodexStatusResponse | null>(null);
   const prepareRuntimeSync = useCallback(async () => {
     if (teamPermission) {
       await teamPermission.warmupSession();
@@ -194,6 +257,38 @@ const AcpSendBox: React.FC<{
         Message.error(getConversationRuntimeWorkspaceErrorMessage(error, t));
       });
   }, [teamPermission, conversation_id, fetchSlashCommands, t]);
+
+  useEffect(() => {
+    if (backend !== 'codex') {
+      setCodexStatus(null);
+      return;
+    }
+
+    let cancelled = false;
+    const loadCodexStatus = async () => {
+      try {
+        const status = await ipcBridge.acpConversation.getCodexStatus.invoke();
+        if (!cancelled) {
+          setCodexStatus(status);
+        }
+      } catch (error) {
+        console.warn('[AcpSendBox] Failed to load Codex status:', error);
+        if (!cancelled) {
+          setCodexStatus(null);
+        }
+      }
+    };
+
+    void loadCodexStatus();
+    const timer = window.setInterval(() => {
+      void loadCodexStatus();
+    }, CODEX_STATUS_POLL_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [backend]);
 
   const handleContentChange = useCallback(
     (val: string) => {
@@ -565,6 +660,33 @@ Please check your local CLI tool authentication status`,
     }
   };
 
+  const codexLimitChips = useMemo(() => {
+    if (backend !== 'codex' || !codexStatus?.available || !codexStatus.rate_limits) {
+      return [];
+    }
+
+    return [codexStatus.rate_limits.primary, codexStatus.rate_limits.secondary]
+      .filter((window): window is CodexRateLimitWindow => Boolean(window))
+      .map((window) => {
+        const remainingPercent = Math.max(0, Math.min(100, 100 - window.used_percent));
+
+        return {
+          key: `${window.window_duration_mins}-${window.resets_at}`,
+          label: formatCodexWindowLabel(window.window_duration_mins),
+          remainingPercent,
+          title: `${formatCodexWindowLabel(window.window_duration_mins)} · ${Math.round(remainingPercent)}% left · ${t(
+            'common.reset',
+            {
+              defaultValue: 'Resets',
+            }
+          )} ${new Date(window.resets_at * 1000).toLocaleString()}`,
+        };
+      });
+  }, [backend, codexStatus, t]);
+
+  const shouldShowStatusStrip = Boolean(tokenUsage) || codexLimitChips.length > 0;
+  const contextLimitDisplay = context_limit > 0 ? context_limit : undefined;
+
   return (
     <div className='max-w-800px w-full mx-auto flex flex-col mt-auto mb-16px'>
       <CommandQueuePanel
@@ -581,6 +703,39 @@ Please check your local CLI tool authentication status`,
         onClear={clear}
       />
       <ThoughtDisplay running={aiProcessing && !hasThinkingMessage} onStop={handleStop} />
+      {shouldShowStatusStrip && (
+        <div className='flex items-center justify-between gap-8px mb-8px px-4px flex-wrap'>
+          <div className='flex items-center gap-8px flex-wrap'>
+            {tokenUsage && (
+              <div
+                className='flex items-center gap-6px text-12px text-t-secondary'
+                data-testid='acp-context-usage-strip'
+              >
+                <ContextUsageIndicator tokenUsage={tokenUsage} context_limit={contextLimitDisplay} size={18} />
+                <span>
+                  {t('conversation.context_usage.contextUsed', { defaultValue: 'context used' })} ·{' '}
+                  {formatTokenCount(tokenUsage.total_tokens)}
+                  {contextLimitDisplay ? ` / ${formatTokenCount(contextLimitDisplay, true)}` : ''}
+                </span>
+              </div>
+            )}
+            {codexLimitChips.map((chip) => (
+              <span
+                key={chip.key}
+                data-testid={`codex-rate-limit-${chip.label}`}
+                title={chip.title}
+                className='inline-flex items-center rounded-full border px-8px py-2px text-12px font-medium'
+                style={getLimitChipStyle(chip.remainingPercent)}
+              >
+                {chip.label} left {Math.round(chip.remainingPercent)}%
+              </span>
+            ))}
+          </div>
+          {codexStatus?.rate_limits?.rate_limit_reached_type && (
+            <span className='text-12px text-t-secondary'>{codexStatus.rate_limits.rate_limit_reached_type}</span>
+          )}
+        </div>
+      )}
 
       <SendBox
         onMobilePlusClick={isMobile ? () => setIsMobileSheetOpen(true) : undefined}

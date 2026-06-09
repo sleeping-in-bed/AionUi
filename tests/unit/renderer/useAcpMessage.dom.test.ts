@@ -10,12 +10,13 @@ import { useAcpMessage } from '@/renderer/pages/conversation/platforms/acp/useAc
 import { getConversationOrNull } from '@/renderer/pages/conversation/utils/conversationCache';
 import type { IResponseMessage } from '@/common/adapter/ipcBridge';
 
-const { addOrUpdateMessageMock, responseStreamOnMock, responseStreamHandlerRef } = vi.hoisted(() => ({
+const { addOrUpdateMessageMock, responseStreamOnMock, responseStreamHandlerRef, getUsageInvokeMock } = vi.hoisted(() => ({
   addOrUpdateMessageMock: vi.fn(),
   responseStreamOnMock: vi.fn(),
   responseStreamHandlerRef: {
     current: undefined as ((message: IResponseMessage) => void) | undefined,
   },
+  getUsageInvokeMock: vi.fn(),
 }));
 
 vi.mock('@/renderer/pages/conversation/Messages/hooks', () => ({
@@ -40,6 +41,9 @@ vi.mock('@/common', () => ({
       warmup: {
         invoke: vi.fn().mockResolvedValue(undefined),
       },
+      getUsage: {
+        invoke: getUsageInvokeMock,
+      },
       getSlashCommands: {
         invoke: vi.fn().mockResolvedValue([]),
       },
@@ -51,6 +55,7 @@ describe('useAcpMessage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     responseStreamHandlerRef.current = undefined;
+    getUsageInvokeMock.mockResolvedValue(null);
   });
 
   it('completes hydration when the conversation lookup fails', async () => {
@@ -167,5 +172,25 @@ describe('useAcpMessage', () => {
         msg_id: 'msg-1',
       })
     );
+  });
+
+  it('restores persisted ACP usage when switching back to a conversation', async () => {
+    vi.mocked(getConversationOrNull).mockResolvedValue({
+      id: 'conv-1',
+      type: 'acp',
+      extra: {},
+    } as never);
+    getUsageInvokeMock.mockResolvedValue({
+      used: 1234,
+      size: 200000,
+    });
+
+    const { result } = renderHook(() => useAcpMessage('conv-1'));
+
+    await waitFor(() => {
+      expect(result.current.hasHydratedRunningState).toBe(true);
+      expect(result.current.tokenUsage).toEqual({ total_tokens: 1234 });
+      expect(result.current.context_limit).toBe(200000);
+    });
   });
 });

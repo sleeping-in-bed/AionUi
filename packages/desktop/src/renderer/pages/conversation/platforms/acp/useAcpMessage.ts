@@ -536,6 +536,21 @@ export const useAcpMessage = (conversation_id: string, options?: { skipWarmup?: 
             setContextLimit(last_context_limit);
           }
         }
+
+        if (res.type === 'acp') {
+          void ipcBridge.conversation.getUsage
+            .invoke({ conversation_id })
+            .then((usage) => {
+              if (cancelled || !usage || typeof usage.used !== 'number') {
+                return;
+              }
+              setTokenUsage({ total_tokens: usage.used });
+              if (typeof usage.size === 'number' && usage.size > 0) {
+                setContextLimit(usage.size);
+              }
+            })
+            .catch(() => {});
+        }
       })
       .catch((error: unknown) => {
         if (cancelled) return;

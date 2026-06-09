@@ -11,20 +11,30 @@ import { BackendHttpError } from '@/common/adapter/httpBridge';
 import AcpSendBox from '@/renderer/pages/conversation/platforms/acp/AcpSendBox';
 import type { UseAcpMessageReturn } from '@/renderer/pages/conversation/platforms/acp/useAcpMessage';
 
-const { sendMessageInvokeMock, addOrUpdateMessageMock, resetStateMock, emitterEmitMock, setSendBoxHandlerMock } =
-  vi.hoisted(() => ({
-    sendMessageInvokeMock: vi.fn(),
-    addOrUpdateMessageMock: vi.fn(),
-    resetStateMock: vi.fn(),
-    emitterEmitMock: vi.fn(),
-    setSendBoxHandlerMock: vi.fn(),
-  }));
+const {
+  sendMessageInvokeMock,
+  getCodexStatusInvokeMock,
+  addOrUpdateMessageMock,
+  resetStateMock,
+  emitterEmitMock,
+  setSendBoxHandlerMock,
+} = vi.hoisted(() => ({
+  sendMessageInvokeMock: vi.fn(),
+  getCodexStatusInvokeMock: vi.fn(),
+  addOrUpdateMessageMock: vi.fn(),
+  resetStateMock: vi.fn(),
+  emitterEmitMock: vi.fn(),
+  setSendBoxHandlerMock: vi.fn(),
+}));
 
 vi.mock('@/common', () => ({
   ipcBridge: {
     acpConversation: {
       sendMessage: {
         invoke: sendMessageInvokeMock,
+      },
+      getCodexStatus: {
+        invoke: getCodexStatusInvokeMock,
       },
     },
     conversation: {
@@ -163,10 +173,13 @@ vi.mock('@arco-design/web-react', () => ({
     success: vi.fn(),
     error: vi.fn(),
   },
+  Popover: ({ children }: { children?: React.ReactNode }) => <>{children}</>,
   Tag: ({ children }: { children?: React.ReactNode }) => <>{children}</>,
 }));
 
-const makeMessageState = (): UseAcpMessageReturn => ({
+const makeMessageState = (
+  overrides: Partial<Pick<UseAcpMessageReturn, 'tokenUsage' | 'context_limit'>> = {}
+): UseAcpMessageReturn => ({
   thought: { subject: '', description: '' },
   setThought: vi.fn(),
   running: true,
@@ -175,8 +188,8 @@ const makeMessageState = (): UseAcpMessageReturn => ({
   aiProcessing: false,
   setAiProcessing: vi.fn(),
   resetState: resetStateMock,
-  tokenUsage: null,
-  context_limit: 0,
+  tokenUsage: overrides.tokenUsage ?? null,
+  context_limit: overrides.context_limit ?? 0,
   hasThinkingMessage: false,
   slashCommands: [],
   fetchSlashCommands: vi.fn(),
@@ -185,6 +198,13 @@ const makeMessageState = (): UseAcpMessageReturn => ({
 describe('AcpSendBox', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    getCodexStatusInvokeMock.mockResolvedValue({
+      available: false,
+      checked_at_ms: Date.now(),
+      requires_openai_auth: true,
+      rate_limits: null,
+      error: 'unavailable',
+    });
   });
 
   it('resets ACP loading state when sendMessage fails before any stream error arrives', async () => {
@@ -218,5 +238,47 @@ describe('AcpSendBox', () => {
     await waitFor(() => {
       expect(resetStateMock).toHaveBeenCalledTimes(1);
     });
+  });
+
+  it('shows context usage and Codex rate-limit chips when data is available', async () => {
+    getCodexStatusInvokeMock.mockResolvedValue({
+      available: true,
+      checked_at_ms: Date.now(),
+      requires_openai_auth: true,
+      auth_mode: 'chatgpt',
+      plan_type: 'pro',
+      rate_limits: {
+        primary: {
+          used_percent: 12.5,
+          window_duration_mins: 300,
+          resets_at: 1_730_947_200,
+        },
+        secondary: {
+          used_percent: 73,
+          window_duration_mins: 10_080,
+          resets_at: 1_731_552_000,
+        },
+      },
+    });
+
+    render(
+      <AcpSendBox
+        conversation_id='conv-1'
+        backend='codex'
+        workspacePath='/tmp/workspace'
+        messageState={makeMessageState({
+          tokenUsage: { total_tokens: 32000 },
+          context_limit: 200000,
+        })}
+      />
+    );
+
+    await waitFor(() => {
+      expect(getCodexStatusInvokeMock).toHaveBeenCalledTimes(1);
+    });
+
+    expect(screen.getByTestId('acp-context-usage-strip')).toHaveTextContent('32.0K / 200K');
+    expect(screen.getByTestId('codex-rate-limit-5h')).toHaveTextContent('5h left 88%');
+    expect(screen.getByTestId('codex-rate-limit-week')).toHaveTextContent('week left 27%');
   });
 });

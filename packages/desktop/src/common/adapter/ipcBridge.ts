@@ -211,6 +211,10 @@ export const conversation = {
   getSlashCommands: httpGet<Array<{ command: string; description: string }>, { conversation_id: string }>(
     (p) => `/api/conversations/${p.conversation_id}/slash-commands`
   ),
+  getUsage: httpGet<{ used?: number; size?: number } | null, { conversation_id: string }>(
+    (p) => `/api/conversations/${p.conversation_id}/usage`,
+    { silentStatuses: [404] }
+  ),
   askSideQuestion: httpPost<ConversationSideQuestionResult, { conversation_id: string; question: string }>(
     (p) => `/api/conversations/${p.conversation_id}/side-question`,
     (p) => ({ question: p.question })
@@ -823,6 +827,22 @@ export const acpConversation = {
     (p) => `/api/conversations/${p.conversation_id}/model`,
     (p) => ({ model_id: p.model_id })
   ),
+  getCodexStatus: httpGet<
+    {
+      available: boolean;
+      checked_at_ms: number;
+      requires_openai_auth: boolean;
+      auth_mode?: string | null;
+      plan_type?: string | null;
+      rate_limits?: {
+        primary?: { used_percent: number; window_duration_mins: number; resets_at: number } | null;
+        secondary?: { used_percent: number; window_duration_mins: number; resets_at: number } | null;
+        rate_limit_reached_type?: string | null;
+      } | null;
+      error?: string | null;
+    },
+    void
+  >('/api/agents/codex/status'),
 };
 
 // ---------------------------------------------------------------------------
