@@ -5,6 +5,7 @@
  */
 
 import { configService } from '@/common/config/configService';
+import { getFullAutoMode } from '@/renderer/utils/model/agentModes';
 import type { AgentSource } from '@/renderer/utils/model/agentTypes';
 
 /** Save preferred mode to the agent's own config key */
@@ -41,6 +42,34 @@ export async function saveAionrsDefaultModel(provider_id: string, use_model: str
   } catch {
     /* silent */
   }
+}
+
+/** Resolve the config key used to persist per-agent preferences. */
+export function getAgentPreferenceKey(
+  agent: {
+    agent_source?: AgentSource;
+    id?: string;
+  } | null | undefined,
+  fallbackKey: string
+): string {
+  if (agent?.agent_source === 'custom' && agent.id) {
+    return agent.id;
+  }
+  return fallbackKey;
+}
+
+/** Resolve the full-auto default mode for a custom ACP agent row. */
+export function getCustomAgentDefaultMode(
+  agent: {
+    agent_source?: AgentSource;
+    backend?: string;
+    yolo_id?: string;
+  } | null | undefined
+): string | undefined {
+  if (agent?.agent_source !== 'custom') {
+    return undefined;
+  }
+  return agent.yolo_id || getFullAutoMode(agent.backend);
 }
 
 /**

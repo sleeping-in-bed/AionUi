@@ -21,7 +21,13 @@ import {
 import { getAgentModes } from '@/renderer/utils/model/agentModes';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import useSWR from 'swr';
-import { savePreferredMode, savePreferredModelId, getAgentKey as getAgentKeyUtil } from './agentSelectionUtils';
+import {
+  getAgentPreferenceKey,
+  getCustomAgentDefaultMode,
+  savePreferredMode,
+  savePreferredModelId,
+  getAgentKey as getAgentKeyUtil,
+} from './agentSelectionUtils';
 import { usePresetAssistantResolver } from './usePresetAssistantResolver';
 import { useAgentAvailability } from './useAgentAvailability';
 import { useCustomAgentsLoader } from './useCustomAgentsLoader';
@@ -102,6 +108,18 @@ function resolveDefaultMode(backend: string | undefined, agents: AgentMetadata[]
   if (staticModes.length > 0) return staticModes[0].value;
 
   return 'default';
+}
+
+function resolveAgentBackend(
+  selectedAgent: string,
+  selectedAgentInfo: AvailableAgent | undefined,
+  isPresetAgent: boolean,
+  effectiveAgentType: string
+): string {
+  if (isPresetAgent) {
+    return effectiveAgentType;
+  }
+  return selectedAgentInfo?.backend || selectedAgentInfo?.agent_type || selectedAgent;
 }
 
 type UseGuidAgentSelectionOptions = {
@@ -259,6 +277,12 @@ export const useGuidAgentSelection = ({
     return findAgentByKey(selectedAgentKey);
   }, [selectedAgentKey, availableAgents, assistants]);
   const is_presetAgent = Boolean(selectedAgentInfo?.is_preset);
+  const selectedDetectedAgent = useMemo(() => {
+    if (is_presetAgent || !selectedAgentInfo) {
+      return undefined;
+    }
+    return selectedAgentInfo as AgentMetadata;
+  }, [is_presetAgent, selectedAgentInfo]);
 
   // --- SWR: Fetch detected execution engines (shared cache) ---
   const { data: availableAgentsData } = useSWR<AvailableAgent[]>(DETECTED_AGENTS_SWR_KEY, fetchDetectedAgents);
@@ -405,32 +429,58 @@ export const useGuidAgentSelection = ({
 
   // Reset selected ACP model when agent changes: prefer saved preference, fallback to handshake default
   useEffect(() => {
-    // For preset agents, resolve to the actual backend type for config lookup
-    const backend = is_presetAgent ? currentEffectiveAgentInfo.agent_type : selectedAgent;
+    const backend = resolveAgentBackend(
+      selectedAgent,
+      selectedAgentInfo,
+      is_presetAgent,
+      currentEffectiveAgentInfo.agent_type
+    );
+    const configKey = is_presetAgent ? backend : getAgentPreferenceKey(selectedDetectedAgent, backend);
 
     const config = configService.get('acp.config');
-    const preferred = (config?.[backend as string] as Record<string, unknown>)?.preferredModelId as string | undefined;
+    const preferred = (config?.[configKey as string] as Record<string, unknown>)?.preferredModelId as string | undefined;
     if (preferred) {
       _setSelectedAcpModel(preferred);
       return;
     }
 
     const metadataAgents = availableAgentsData as unknown as AgentMetadata[] | undefined;
-    const matched = metadataAgents?.find((a) => (a.backend ?? a.agent_type) === backend);
+    const matched =
+      selectedDetectedAgent?.agent_source === 'custom' && selectedDetectedAgent.id
+        ? metadataAgents?.find((a) => a.id === selectedDetectedAgent.id)
+        : metadataAgents?.find((a) => (a.backend ?? a.agent_type) === backend);
     const handshakeModels = matched?.handshake?.available_models as AcpModelInfo | undefined;
     _setSelectedAcpModel(handshakeModels?.current_model_id ?? null);
-  }, [selectedAgentKey, availableAgentsData, is_presetAgent, currentEffectiveAgentInfo.agent_type]);
+  }, [
+    selectedAgent,
+    selectedAgentInfo,
+    selectedDetectedAgent,
+    availableAgentsData,
+    is_presetAgent,
+    currentEffectiveAgentInfo.agent_type,
+  ]);
 
   // Read preferred mode or fallback to legacy yoloMode config
   useEffect(() => {
-    // For preset agents, use the effective backend type for config lookup and mode saving
-    const configKey = is_presetAgent ? currentEffectiveAgentInfo.agent_type : selectedAgent;
+    const backend = resolveAgentBackend(
+      selectedAgent,
+      selectedAgentInfo,
+      is_presetAgent,
+      currentEffectiveAgentInfo.agent_type
+    );
+    // For preset agents, use the effective backend type for config lookup and mode saving.
+    // Custom agent rows persist their preference by row id so one row does not
+    // accidentally overwrite another row that shares the same backend label.
+    const configKey = is_presetAgent ? backend : getAgentPreferenceKey(selectedDetectedAgent, backend);
     selectedAgentRef.current = configKey;
+    const customDefaultMode = getCustomAgentDefaultMode(selectedDetectedAgent);
     // Reset to the backend's actual default (from handshake.available_modes),
     // not the literal 'default' — codex/opencode/cursor don't have that value.
-    const fallbackMode = resolveDefaultMode(configKey, availableAgentsData as unknown as AgentMetadata[] | undefined);
+    const fallbackMode =
+      customDefaultMode ||
+      resolveDefaultMode(backend, availableAgentsData as unknown as AgentMetadata[] | undefined);
     _setSelectedMode(fallbackMode);
-    if (!configKey) return;
+    if (!backend) return;
 
     let cancelled = false;
 
@@ -440,7 +490,7 @@ export const useGuidAgentSelection = ({
         let preferred: string | undefined;
         let yoloMode = false;
 
-        if (configKey === 'aionrs') {
+        if (backend === 'aionrs') {
           const config = configService.get('aionrs.config');
           preferred = config?.preferredMode;
         } else {
@@ -453,9 +503,9 @@ export const useGuidAgentSelection = ({
         if (cancelled) return;
 
         // 1. Use preferredMode if valid
-        const normalizedPreferred = configKey === 'codex' ? normalizeCodexMode(preferred) : preferred;
+        const normalizedPreferred = backend === 'codex' ? normalizeCodexMode(preferred) : preferred;
         if (normalizedPreferred) {
-          const modes = getAgentModes(configKey);
+          const modes = getAgentModes(backend);
           if (modes.some((m) => m.value === normalizedPreferred)) {
             _setSelectedMode(normalizedPreferred);
             return;
@@ -470,7 +520,13 @@ export const useGuidAgentSelection = ({
             codex: CODEX_MODE_NATIVE_FULL_ACCESS,
             qwen: 'yolo',
           };
-          _setSelectedMode(yoloValues[configKey] || 'yolo');
+          _setSelectedMode(yoloValues[backend] || 'yolo');
+          return;
+        }
+
+        // 3. Custom agent rows default to full-auto even when there is no saved preference.
+        if (customDefaultMode) {
+          _setSelectedMode(customDefaultMode);
         }
       } catch {
         /* silent */
@@ -482,18 +538,32 @@ export const useGuidAgentSelection = ({
     return () => {
       cancelled = true;
     };
-  }, [selectedAgent, is_presetAgent, currentEffectiveAgentInfo.agent_type, availableAgentsData]);
+  }, [
+    selectedAgent,
+    selectedAgentInfo,
+    selectedDetectedAgent,
+    is_presetAgent,
+    currentEffectiveAgentInfo.agent_type,
+    availableAgentsData,
+  ]);
 
   const currentAcpCachedModelInfo = useMemo(() => {
-    // For preset agents, resolve to the actual backend type for model list lookup
-    const backend = is_presetAgent ? currentEffectiveAgentInfo.agent_type : selectedAgent;
+    const backend = resolveAgentBackend(
+      selectedAgent,
+      selectedAgentInfo,
+      is_presetAgent,
+      currentEffectiveAgentInfo.agent_type
+    );
 
     // Source: `handshake.available_models` from `/api/agents`.
     // The backend persists the last-seen `ModelInfoPayload` (snake_case) on
     // the agent_metadata row, so this is populated across restarts without
     // requiring a fresh session.
     const metadataAgents = availableAgentsData as unknown as AgentMetadata[] | undefined;
-    const matched = metadataAgents?.find((a) => (a.backend ?? a.agent_type) === backend);
+    const matched =
+      selectedDetectedAgent?.agent_source === 'custom' && selectedDetectedAgent.id
+        ? metadataAgents?.find((a) => a.id === selectedDetectedAgent.id)
+        : metadataAgents?.find((a) => (a.backend ?? a.agent_type) === backend);
     const handshakeModels = matched?.handshake?.available_models as AcpModelInfo | undefined;
     if (
       handshakeModels &&
@@ -515,7 +585,14 @@ export const useGuidAgentSelection = ({
     }
 
     return null;
-  }, [selectedAgentKey, is_presetAgent, currentEffectiveAgentInfo.agent_type, availableAgentsData]);
+  }, [
+    selectedAgent,
+    selectedAgentInfo,
+    selectedDetectedAgent,
+    is_presetAgent,
+    currentEffectiveAgentInfo.agent_type,
+    availableAgentsData,
+  ]);
 
   // Key of the first non-preset CLI agent (used as fallback when leaving preset mode)
   const defaultAgentKey = useMemo(() => {

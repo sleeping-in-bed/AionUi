@@ -7,6 +7,7 @@
 import type { CustomAgentAdvancedOverrides, CustomAgentBackend } from '@/common/types/platform/acpTypes';
 import type { AgentMetadata } from '@/renderer/utils/model/agentTypes';
 import { acpConversation } from '@/common/adapter/ipcBridge';
+import { getFullAutoMode } from '@/common/types/agent/agentModes';
 import { Alert, Avatar, Button, Collapse, Input, Select, Typography } from '@arco-design/web-react';
 import { Plus, Delete, CheckOne, CloseOne } from '@icon-park/react';
 import EmojiPicker from '@/renderer/components/chat/EmojiPicker';
@@ -137,6 +138,12 @@ function agentToAdvanced(agent: AgentMetadata): CustomAgentAdvancedOverrides {
   return advanced;
 }
 
+function getDefaultAdvancedOverrides(backend: string | undefined): CustomAgentAdvancedOverrides {
+  return {
+    yolo_id: getFullAutoMode(backend),
+  };
+}
+
 const InlineAgentEditor: React.FC<InlineAgentEditorProps> = ({ agent, onSave, onCancel }) => {
   const { t } = useTranslation();
   const { theme } = useThemeContext();
@@ -190,7 +197,10 @@ const InlineAgentEditor: React.FC<InlineAgentEditorProps> = ({ agent, onSave, on
       setBackend(normalizeCustomAgentBackend(agent.backend));
       setArgsString(agent.args?.join(' ') || '');
       setEnvVars(objectToEnvVars(agentEnvToRecord(agent.env)));
-      setAdvanced(agentToAdvanced(agent));
+      setAdvanced({
+        ...getDefaultAdvancedOverrides(agent.backend),
+        ...agentToAdvanced(agent),
+      });
     } else {
       setAvatar('🤖');
       setName('');
@@ -198,7 +208,7 @@ const InlineAgentEditor: React.FC<InlineAgentEditorProps> = ({ agent, onSave, on
       setBackend(undefined);
       setArgsString('');
       setEnvVars([]);
-      setAdvanced({});
+      setAdvanced(getDefaultAdvancedOverrides(undefined));
     }
     setShowAdvanced(false);
   }, [agent]);
@@ -252,7 +262,12 @@ const InlineAgentEditor: React.FC<InlineAgentEditorProps> = ({ agent, onSave, on
   }, []);
   const handleBackendChange = useCallback((value: string) => {
     isJsonEditingRef.current = false;
-    setBackend(value ? (value as CustomAgentBackend) : undefined);
+    const nextBackend = value ? (value as CustomAgentBackend) : undefined;
+    setBackend(nextBackend);
+    setAdvanced((prev) => ({
+      ...prev,
+      yolo_id: getFullAutoMode(nextBackend),
+    }));
   }, []);
 
   const addEnvVar = useCallback(() => {

@@ -9,6 +9,7 @@ import { ipcBridge } from '@/common';
 import type { ICreateConversationParams } from '@/common/adapter/ipcBridge';
 import type { IProvider, TProviderWithModel } from '@/common/config/storage';
 import type { Assistant } from '@/common/types/agent/assistantTypes';
+import { getFullAutoMode } from '@/common/types/agent/agentModes';
 import { DEFAULT_CODEX_MODELS } from '@/common/types/codex/codexModels';
 import { CODEX_MODE_NATIVE_FULL_ACCESS, normalizeCodexMode } from '@/common/types/codex/codexModes';
 import { resolveLocaleKey } from '@/common/utils';
@@ -22,6 +23,7 @@ import { getAgents } from '@/renderer/hooks/agent/useAgents';
 import type { AcpModelInfo } from '@/common/types/platform/acpTypes';
 import { getAgentModes } from '@/renderer/utils/model/agentModes';
 import { hasSpecificModelCapability } from '@/renderer/utils/model/modelCapabilities';
+import { getAgentPreferenceKey } from '@/renderer/pages/guid/hooks/agentSelectionUtils';
 
 type ModePreference = {
   preferredMode?: string;
@@ -34,7 +36,11 @@ const LEGACY_YOLO_MODE_MAP: Partial<Record<string, string>> = {
   qwen: 'yolo',
 };
 
-async function resolvePreferredMode(backend: string): Promise<string | undefined> {
+async function resolvePreferredMode(
+  backend: string,
+  configKey = backend,
+  fallbackMode?: string
+): Promise<string | undefined> {
   const modeOptions = getAgentModes(backend);
   if (modeOptions.length === 0) {
     return undefined;
@@ -46,7 +52,7 @@ async function resolvePreferredMode(backend: string): Promise<string | undefined
     preference = configService.get('aionrs.config');
   } else {
     const acpConfig = configService.get('acp.config');
-    preference = acpConfig?.[backend as string];
+    preference = acpConfig?.[configKey as string];
   }
 
   const normalizedPreferredMode =
@@ -60,12 +66,20 @@ async function resolvePreferredMode(backend: string): Promise<string | undefined
     return legacyMode;
   }
 
+  if (fallbackMode && modeOptions.some((option) => option.value === fallbackMode)) {
+    return fallbackMode;
+  }
+
   return undefined;
 }
 
-async function resolvePreferredAcpModelId(backend: string): Promise<string | undefined> {
+async function resolvePreferredAcpModelId(
+  backend: string,
+  configKey = backend,
+  matchedAgentId?: string
+): Promise<string | undefined> {
   const acpConfig = configService.get('acp.config');
-  const backendConfig = acpConfig?.[backend as string] as { preferredModelId?: string } | undefined;
+  const backendConfig = acpConfig?.[configKey as string] as { preferredModelId?: string } | undefined;
   const preferredModelId = backendConfig?.preferredModelId;
   if (typeof preferredModelId === 'string' && preferredModelId.trim().length > 0) {
     return preferredModelId;
@@ -73,7 +87,9 @@ async function resolvePreferredAcpModelId(backend: string): Promise<string | und
 
   // Fallback: last-seen model info persisted on the backend's agent_metadata row.
   const agents = await getAgents();
-  const matched = agents.find((a) => (a.backend ?? a.agent_type) === backend);
+  const matched = matchedAgentId
+    ? agents.find((a) => a.id === matchedAgentId)
+    : agents.find((a) => (a.backend ?? a.agent_type) === backend);
   const handshakeModels = matched?.handshake?.available_models as AcpModelInfo | undefined;
   const handshakeModelId = handshakeModels?.current_model_id;
   if (typeof handshakeModelId === 'string' && handshakeModelId.trim().length > 0) {
@@ -162,8 +178,11 @@ export async function getDefaultAionrsModel(): Promise<TProviderWithModel> {
 export async function buildCliAgentParams(agent: AgentMetadata, workspace: string): Promise<ICreateConversationParams> {
   const agentKey = agent.backend || agent.agent_type;
   const type = getConversationTypeForBackend(agentKey);
-  const preferredMode = await resolvePreferredMode(agentKey);
-  const preferredAcpModelId = type === 'acp' ? await resolvePreferredAcpModelId(agentKey) : undefined;
+  const configKey = getAgentPreferenceKey(agent, agentKey);
+  const fallbackMode = agent.agent_source === 'custom' ? agent.yolo_id || getFullAutoMode(agent.backend) : undefined;
+  const preferredMode = await resolvePreferredMode(agentKey, configKey, fallbackMode);
+  const preferredAcpModelId =
+    type === 'acp' ? await resolvePreferredAcpModelId(agentKey, configKey, agent.agent_source === 'custom' ? agent.id : undefined) : undefined;
 
   let model: TProviderWithModel;
   if (type === 'aionrs') {
